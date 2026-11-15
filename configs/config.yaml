@@ -1,0 +1,89 @@
+experiment:
+  mode: v5                        # Chosen research configuration; override with --mode
+
+dataset:
+  root: data/datasets/MOT17
+  split: train
+  sequence_suffix: FRCNN
+  default_sequence: MOT17-02-FRCNN
+  fps_fallback: 30
+
+detector:
+  weights: yolov8n.pt
+  tracker: configs/bytetrack_custom.yaml
+  confidence: 0.35                 # Historical MOT17 benchmark; demo_pc defaults to 0.10
+  iou: 0.50
+  image_size: 640
+  classes: [0]
+  device: 0                        # RTX 3050: CUDA device 0; CPU: "cpu"
+
+identity:
+  max_lost_seconds:
+    baseline: 0
+    v1: 3.0
+    v2: 20.0
+    v3: 20.0
+    v4: 20.0
+  max_center_distance: 180
+  max_height_ratio: 2.0
+  max_motion_speed: 12.0
+  appearance_threshold: 0.35
+  motion_weight: 0.45
+  appearance_weight: 0.55
+  v4:
+    max_lost_seconds: 20.0
+    max_height_ratio: 1.9
+    appearance_gate: 0.48
+    active_appearance_gate: 0.62
+    appearance_weight: 0.72
+    motion_weight: 0.28
+    motion_gate_base: 0.75
+    motion_gate_per_second: 0.12
+    max_motion_gate: 2.8
+    max_fusion_cost: 0.52
+    ambiguity_margin: 0.035
+    gallery_size: 8
+    gallery_update_gate: 0.42
+    min_embedding_confidence: 0.35
+    min_box_height: 24
+  v5:
+    max_lost_seconds: 20.0
+    max_height_ratio: 2.0
+    appearance_gate: 0.48
+    active_appearance_gate: 0.72
+    appearance_weight: 0.72
+    motion_weight: 0.28
+    motion_gate_base: 0.75
+    motion_gate_per_second: 0.14
+    max_motion_gate: 3.2
+    max_fusion_cost: 0.68
+    ambiguity_margin: 0.035
+    gallery_size: 12
+    gallery_update_gate: 0.55
+    min_embedding_confidence: 0.35
+    min_box_height: 28
+    strong_appearance_distance: 0.18
+    adaptive_gap_seconds: 3.0
+    uncertainty_weight: 0.15
+  v5_1:
+    min_crop_quality: 0.42
+    gallery_diversity_distance: 0.035
+    gallery_replace_quality_margin: 0.06
+    target_min_visibility: 0.0
+    target_lost_gap_frames: 5
+    target_max_reacquisition_frames: 90
+
+reid:
+  model_name: osnet_x0_25         # Legacy V2-V4 comparison; final PC demo uses reid.v5
+  device: cuda
+  image_size: [256, 128]
+  embedding_interval: 5
+  v5:
+    model_name: osnet_x0_5
+    checkpoint: checkpoints/osnet_x0_5_msmt17.pth.tar
+    device: cuda:0
+    image_size: [256, 128]
+    embedding_interval: 3
+
+output:
+  root: outputs/mot17

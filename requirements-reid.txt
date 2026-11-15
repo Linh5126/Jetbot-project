@@ -1,0 +1,4 @@
+# Install after a CUDA-compatible PyTorch build has already been installed.
+gdown>=5.2
+# Official Torchreid implementation required by src/reid/osnet_embedder.py
+git+https://github.com/KaiyangZhou/deep-person-reid.git

@@ -1,0 +1,2 @@
+# Optional: deterministic logic tests without dataset or model weights.
+pytest>=8.0
