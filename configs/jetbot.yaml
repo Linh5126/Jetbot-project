@@ -1,0 +1,42 @@
+robot:
+  host: 192.168.16.44        # SỬA: IP hiện trên OLED của bot
+  port: 8100
+
+stream:
+  width: 640
+  height: 480
+  fps: 15
+  quality: 80
+  flip: 0                    # đổi thành 1 nếu ảnh bị lộn ngược
+  connect_timeout_s: 3.0
+  read_timeout_s: 2.0
+
+runtime:
+  expected_fps: 12           # SỬA: FPS pipeline đo được ở bước 10.2
+  stale_frame_s: 0.35        # frame cũ hơn mức này -> lệnh 0
+  no_frame_timeout_s: 0.5    # không có frame mới trong khoảng này -> lệnh 0
+  max_lost_seconds: 5.0      # giây thật, sau đó STOPPED
+
+drive:
+  forward_to_wheel: 2.0      # forward tối đa 0,15 -> 0,30
+  turn_to_wheel: 0.4         # turn tối đa 0,45 -> 0,18
+  wheel_deadzone: 0.15       # SỬA: đo ở bước 10.3
+  max_wheel: 0.50
+  left_trim: 1.0             # SỬA nếu xe đi lệch
+  right_trim: 1.0
+  invert_left: false
+  invert_right: false
+  send_hz: 10
+  command_ttl_s: 0.4
+  http_timeout_s: 0.3
+  max_step_per_tick: 0.15    # giới hạn tăng tốc mỗi lần gửi
+
+controller:                  # ghi đè ControllerConfig
+  desired_person_height_ratio: 0.55   # SỬA sau khi thử khoảng cách bám
+  forward_gain: 0.55
+  turn_gain: 0.7
+  max_forward: 0.15
+  max_turn: 0.45
+  horizontal_deadband: 0.07
+  height_deadband: 0.06
+  min_target_height_ratio: 0.08
