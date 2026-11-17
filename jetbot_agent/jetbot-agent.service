@@ -1,0 +1,17 @@
+[Unit]
+Description=JetBot HTTP agent (:8100)
+After=network-online.target nvargus-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetbot
+WorkingDirectory=/home/jetbot/jetbot_agent
+ExecStart=/usr/bin/python3 /home/jetbot/jetbot_agent/agent.py
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
