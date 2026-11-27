@@ -1,6 +1,5 @@
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -8,10 +7,10 @@ import numpy as np
 
 def score_person_crop_quality(
     crop: np.ndarray,
-    bbox: list[float] | tuple[float, ...],
-    frame_shape: tuple[int, ...],
+    bbox: Union[List[float], Tuple[float, ...]],
+    frame_shape: Tuple[int, ...],
     detection_confidence: float = 1.0,
-) -> dict[str, float]:
+) -> Dict[str, float]:
     """Return an inexpensive, deterministic quality estimate for a person crop.
 
     The score is a heuristic for gallery admission, not a calibrated probability.

@@ -50,7 +50,7 @@ class FakeMotor:
 
 
 class JetbotLibMotor:
-    """NVIDIA jetbot package (handles Adafruit MotorHAT and Waveshare boards)."""
+    """`jetbot` Python package preinstalled on the robot image (MotorHAT / Waveshare boards)."""
     name = "jetbot"
 
     def __init__(self):

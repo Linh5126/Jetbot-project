@@ -8,17 +8,16 @@ Identity continuity and permission to move are deliberately independent:
 This is a safety *gate*, not a claim of reliable biometric identity matching.
 Appearance-only matching can still confuse similarly dressed people.
 """
-from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from src.following.target_lock import FollowState, LockResult, TargetObservation
 
 
-def _unit(embedding: object) -> np.ndarray | None:
+def _unit(embedding: object) -> Optional[np.ndarray]:
     if embedding is None:
         return None
     try:
@@ -44,6 +43,16 @@ def _box_overlap(box_a: Sequence[float], box_b: Sequence[float]) -> float:
     return intersection / min(area_a, area_b)
 
 
+def _same_person_part(small: Sequence[float], big: Sequence[float]) -> bool:
+    """A second detector box on one person: inside the other, sharing its top (head)."""
+    big_h = float(big[3]) - float(big[1])
+    small_h = float(small[3]) - float(small[1])
+    centre = (float(small[0]) + float(small[2])) / 2
+    return (0 < small_h < big_h and _box_overlap(small, big) >= 0.9
+            and abs(float(small[1]) - float(big[1])) <= 0.1 * big_h
+            and big[0] + 0.25 * (big[2] - big[0]) <= centre <= big[2] - 0.25 * (big[2] - big[0]))
+
+
 @dataclass(frozen=True)
 class GuardConfig:
     confirm_frames: int = 5  # New ByteTrack ID: conservative confirmation.
@@ -61,6 +70,16 @@ class GuardConfig:
     selection_max_overlap: float = 0.20
     motion_gate_in_heights: float = 3.5
     motion_window_frames: int = 30
+    max_views: int = 4  # Operator-added reference views (front, side, back...).
+    # Real-robot additions (27/11 corridor log: a single frozen look lost the same person whenever
+    # the light or the pose changed). All default off, so the MOT17-tuned behaviour is unchanged.
+    continuity_distance: float = 0.0  # >0: the trusted track, verified last frame, may drift up to this
+    auto_views: int = 0               # extra looks added while verified; each must match the operator's
+    auto_view_interval: int = 21      # frames between two automatic looks (~1.5 s)
+    auto_view_min_distance: float = 0.18  # only a look this different from every stored one is worth adding
+    blind_frames: int = 0             # trusted track seen but without usable Re-ID: keep it this many frames
+    blind_min_confidence: float = 0.10
+    drop_part_boxes: bool = False     # 27/11: YOLO adds an upper-body box on the same person -> OCCLUDED
 
     def __post_init__(self) -> None:
         frame_counts = (self.confirm_frames, self.same_track_confirm_frames,
@@ -79,6 +98,12 @@ class GuardConfig:
             raise ValueError("Invalid ambiguity/overlap thresholds")
         if self.motion_gate_in_heights <= 0 or self.motion_window_frames < 0:
             raise ValueError("Invalid motion gate")
+        if self.max_views < 1:
+            raise ValueError("max_views must be >= 1")
+        if self.continuity_distance and not self.track_distance <= self.continuity_distance <= 2.0:
+            raise ValueError("continuity_distance must be 0 (off) or >= track_distance")
+        if min(self.auto_views, self.blind_frames) < 0 or self.auto_view_interval < 1:
+            raise ValueError("auto_views and blind_frames must be >= 0, auto_view_interval >= 1")
 
 
 @dataclass(frozen=True)
@@ -86,14 +111,14 @@ class GuardDiagnostics:
     """Read-only lock evidence; useful for UI and reproducible trace CSV."""
     identity_locked: bool
     movement_authorized: bool
-    trusted_track_id: int | None
-    candidate_track_id: int | None
+    trusted_track_id: Optional[int]
+    candidate_track_id: Optional[int]
     candidate_hits: int
     candidate_clear_streak: int
     candidate_required: int
-    reference_distance: float | None
-    competitor_margin: float | None
-    candidate_overlap: float | None
+    reference_distance: Optional[float]
+    competitor_margin: Optional[float]
+    candidate_overlap: Optional[float]
     reason_code: str
 
 
@@ -103,30 +128,38 @@ class GuardedTargetLock:
     A short evidence interruption may preserve the *candidate* vote count, but
     the interruption always revokes movement immediately. New tracker IDs must
     pass longer confirmation than previously trusted IDs. Neither target ID
-    nor reference embedding is ever updated automatically.
+    nor reference embedding is updated automatically by default; the operator may
+    add views of the *currently verified* target with add_view(). On the robot
+    (GuardConfig.auto_views > 0) up to auto_views extra looks are added while the
+    target is verified, alone and unambiguous, and only if the look still matches the
+    operator's own views within track_distance, so the reference cannot drift to
+    someone else. continuity_distance and blind_frames relax only the *trusted, continuous*
+    track; a new or recovered track still needs the strict recovery thresholds.
     """
 
-    def __init__(self, config: GuardConfig | None = None) -> None:
+    def __init__(self, config: Optional[GuardConfig] = None) -> None:
         self.config = config or GuardConfig()
         self.reset()
 
     def reset(self) -> None:
         self.state = FollowState.IDLE
-        self.target_id: int | None = None
-        self._anchor: np.ndarray | None = None
-        self._active_track: int | None = None
+        self.target_id: Optional[int] = None
+        self._anchors: List[np.ndarray] = []
+        self._auto_anchors: List[np.ndarray] = []
+        self._next_auto_view = 0
+        self._active_track: Optional[int] = None
         self._last_frame = -1
         self._last_seen = -1  # Last *authorized* observation.
-        self._last_bbox: tuple[float, ...] | None = None
+        self._last_bbox: Optional[Tuple[float, ...]] = None
         self._clear_candidate()
         self._reason = "No target selected"
         self._reason_code = "IDLE"
-        self._distance_value: float | None = None
-        self._margin_value: float | None = None
-        self._overlap_value: float | None = None
+        self._distance_value: Optional[float] = None
+        self._margin_value: Optional[float] = None
+        self._overlap_value: Optional[float] = None
 
     def _clear_candidate(self) -> None:
-        self._candidate_track: int | None = None
+        self._candidate_track: Optional[int] = None
         self._candidate_hits = 0
         self._candidate_streak = 0
         self._candidate_last_clear = -1
@@ -135,7 +168,7 @@ class GuardedTargetLock:
     @property
     def diagnostics(self) -> GuardDiagnostics:
         return GuardDiagnostics(
-            identity_locked=self._anchor is not None and self.target_id is not None,
+            identity_locked=bool(self._anchors) and self.target_id is not None,
             movement_authorized=self.state in (FollowState.TRACKING, FollowState.REACQUIRED),
             trusted_track_id=self._active_track,
             candidate_track_id=self._candidate_track,
@@ -148,7 +181,7 @@ class GuardedTargetLock:
             reason_code=self._reason_code,
         )
 
-    def _result(self, observation: TargetObservation | None = None) -> LockResult:
+    def _result(self, observation: Optional[TargetObservation] = None) -> LockResult:
         return LockResult(self.state, self.target_id, observation, self._reason)
 
     def stop(self, reason: str = "Operator stop") -> LockResult:
@@ -172,7 +205,7 @@ class GuardedTargetLock:
         ), default=0.0)
 
     def select(self, observation: TargetObservation, frame_id: int,
-               detections: Sequence[Mapping] | None = None) -> LockResult:
+               detections: Optional[Sequence[Mapping]] = None) -> LockResult:
         if frame_id < self._last_frame:
             raise ValueError("frame_id must be monotonic")
         detections = list(detections or [])
@@ -188,7 +221,7 @@ class GuardedTargetLock:
         assert anchor is not None
         self.reset()
         self.target_id = observation.target_id
-        self._anchor = anchor.copy()  # Critical: no automatic gallery updates.
+        self._anchors = [anchor.copy()]  # operator looks; automatic ones only with GuardConfig.auto_views
         self._active_track = observation.track_id
         self._last_frame = self._last_seen = int(frame_id)
         self._last_bbox = observation.bbox
@@ -199,9 +232,81 @@ class GuardedTargetLock:
 
     def _distance(self, detection: Mapping) -> float:
         vector = _unit(detection.get("embedding"))
-        if self._anchor is None or vector is None or vector.shape != self._anchor.shape:
+        if not self._anchors or vector is None or vector.shape != self._anchors[0].shape:
             return float("inf")
-        return float(np.clip(1.0 - float(np.dot(self._anchor, vector)), 0.0, 2.0))
+        best = max(float(np.dot(anchor, vector)) for anchor in self._anchors + self._auto_anchors)
+        return float(np.clip(1.0 - best, 0.0, 2.0))
+
+    def _operator_distance(self, vector: np.ndarray) -> float:
+        return float(1.0 - max(float(np.dot(anchor, vector)) for anchor in self._anchors))
+
+    def _maybe_add_auto_view(self, frame_id: int, detection: Mapping, distance: float,
+                             margin: float, detections: Sequence[Mapping]) -> None:
+        cfg = self.config
+        vector = _unit(detection["embedding"])
+        if (not cfg.auto_views or frame_id < self._next_auto_view or vector is None
+                or distance < cfg.auto_view_min_distance or margin < 2 * cfg.ambiguity_margin
+                or self._overlap(detection, detections) > cfg.selection_max_overlap
+                or self._operator_distance(vector) > cfg.track_distance):
+            return
+        self._auto_anchors = (self._auto_anchors + [vector.copy()])[-cfg.auto_views:]  # oldest out
+        self._next_auto_view = frame_id + cfg.auto_view_interval
+
+    def _drop_part_boxes(self, detections: List[Mapping]) -> List[Mapping]:
+        """Keep one box per person: the trusted track's if it is one of the pair, else the larger."""
+        drop = set()
+        for i, a in enumerate(detections):
+            for j, b in enumerate(detections):
+                if i != j and _same_person_part(a["bbox"], b["bbox"]):
+                    drop.add(j if int(a["track_id"]) == self._active_track else i)  # a inside b
+        return [d for k, d in enumerate(detections) if k not in drop]
+
+    def _blind_continue(self, frame_id: int, detections: Sequence[Mapping]) -> Optional[LockResult]:
+        """Trusted track in view but without usable Re-ID (backlight, half hidden): keep it briefly."""
+        cfg = self.config
+        if (not cfg.blind_frames or self.state not in (FollowState.TRACKING, FollowState.REACQUIRED)
+                or frame_id - self._last_seen > cfg.blind_frames):
+            return None
+        trusted = [d for d in detections if int(d["track_id"]) == self._active_track]
+        if (len(trusted) != 1 or self._usable(trusted[0])
+                or float(trusted[0].get("confidence", 0.0)) < cfg.blind_min_confidence
+                or self._overlap(trusted[0], detections) > cfg.max_overlap
+                or not self._motion_ok(trusted[0], frame_id)
+                or any(self._usable(d) and self._distance(d) <= cfg.track_distance
+                       for d in detections if d is not trusted[0])):
+            return None
+        observation = TargetObservation.from_detection(trusted[0])
+        self._last_bbox = observation.bbox  # _last_seen stays: the blind stretch is bounded
+        self.state = FollowState.TRACKING
+        self._reason = f"Same track without Re-ID ({frame_id - self._last_seen}/{cfg.blind_frames})"
+        self._reason_code = "TRACK_CONTINUED"
+        return self._result(observation)
+
+    @property
+    def view_count(self) -> int:
+        return len(self._anchors)
+
+    def add_view(self, frame_id: int, detections: Sequence[Mapping]) -> int:
+        """Operator-confirmed: add the target's current look (e.g. its back).
+
+        Only for the trusted track verified in this very frame, alone in view;
+        the operator must confirm on screen that the box is the right person.
+        """
+        if (self.state not in (FollowState.TRACKING, FollowState.REACQUIRED)
+                or int(frame_id) != self._last_seen):
+            raise ValueError("Add a view only while the target is verified (TRACKING)")
+        if len(self._anchors) >= self.config.max_views:
+            raise ValueError(f"Already {len(self._anchors)} views; reselect to start over")
+        detections = list(detections)
+        matching = [d for d in detections if int(d["track_id"]) == self._active_track]
+        if len(matching) != 1 or not self._usable(matching[0]):
+            raise ValueError("Target view is weak or missing in this frame")
+        if self._overlap(matching[0], detections) > self.config.selection_max_overlap:
+            raise ValueError("Target overlaps another person; add the view when alone")
+        anchor = _unit(matching[0]["embedding"])
+        assert anchor is not None
+        self._anchors.append(anchor.copy())
+        return len(self._anchors)
 
     def _motion_ok(self, detection: Mapping, frame_id: int) -> bool:
         if self._last_bbox is None or frame_id - self._last_seen > self.config.motion_window_frames:
@@ -245,6 +350,11 @@ class GuardedTargetLock:
         if len(track_ids) != len(set(track_ids)):
             return self._hold("Duplicate ByteTrack IDs: HOLD", "DUPLICATE_TRACK")
 
+        if self.config.drop_part_boxes:
+            detections = self._drop_part_boxes(detections)
+        blind = self._blind_continue(frame_id, detections)
+        if blind is not None:
+            return blind
         ranked = sorted(((self._distance(d), d) for d in detections if self._usable(d)),
                         key=lambda pair: pair[0])
         if not ranked:
@@ -259,7 +369,7 @@ class GuardedTargetLock:
         same_track = int(best["track_id"]) == self._active_track
         was_authorized = self.state in (FollowState.TRACKING, FollowState.REACQUIRED)
         if same_track and was_authorized:
-            threshold = self.config.track_distance
+            threshold = max(self.config.track_distance, self.config.continuity_distance)
         elif same_track and frame_id - self._last_seen <= self.config.motion_window_frames:
             threshold = self.config.same_track_recovery_distance
         else:
@@ -283,6 +393,8 @@ class GuardedTargetLock:
             self._last_bbox = observation.bbox
             self._reason = f"Frozen-reference match d={best_dist:.3f}"
             self._reason_code = "TRACK_VERIFIED"
+            self._maybe_add_auto_view(frame_id, best, best_dist,
+                                      second_dist - best_dist, detections)
             return self._result(observation)
 
         required = (self.config.same_track_confirm_frames if same_track

@@ -3,8 +3,8 @@
 Stop layers: Guard -> zero command; this driver's TTL (main loop silent > ttl
 -> zero); the agent's own watchdog (no request for ~1 s -> motors off).
 """
-from __future__ import annotations
 
+from typing import Optional, Tuple
 import logging
 import math
 import threading
@@ -41,7 +41,7 @@ class DriveConfig:
             raise ValueError("Need send_hz >= 2 and command_ttl_s in [0.1, 1.0)")
 
 
-def mix(command: MotionCommand, cfg: DriveConfig) -> tuple[float, float]:
+def mix(command: MotionCommand, cfg: DriveConfig) -> Tuple[float, float]:
     """(forward, turn) -> (left, right) in [-max_wheel, max_wheel]. Positive turn = left."""
     if command.forward == 0.0 and command.turn == 0.0:
         return ZERO
@@ -58,8 +58,18 @@ def mix(command: MotionCommand, cfg: DriveConfig) -> tuple[float, float]:
     return shape(f - t, cfg.left_trim, cfg.invert_left), shape(f + t, cfg.right_trim, cfg.invert_right)
 
 
-def _step(current: float, target: float, limit: float) -> float:
-    return current + max(-limit, min(limit, target - current))
+def _step(current: float, target: float, limit: float, floor: float) -> float:
+    """Rate-limit acceleration only; braking and reversal apply at once.
+
+    A limited brake/reversal kept the bot pivoting ~0.7 s after the turn
+    command flipped (robot_04 frames 893-906) and it overshot the person.
+    """
+    if current * target <= 0:
+        current = 0.0
+    if abs(target) <= abs(current):
+        return target
+    # Below the deadzone the wheel does not move, so accelerate from its edge.
+    return math.copysign(min(abs(target), max(abs(current), floor) + limit), target)
 
 
 class JetBotHttpDriver:
@@ -80,7 +90,7 @@ class JetBotHttpDriver:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._target = ZERO
-        self._t_last_send: float | None = None
+        self._t_last_send: Optional[float] = None
         self._sent = ZERO
         self._errors = 0
         self._closed = False
@@ -120,8 +130,9 @@ class JetBotHttpDriver:
         if target == ZERO:
             wheels = ZERO      # stopping is never rate-limited
         else:
-            limit = self.cfg.max_step_per_tick
-            wheels = (_step(self._sent[0], target[0], limit), _step(self._sent[1], target[1], limit))
+            limit, floor = self.cfg.max_step_per_tick, self.cfg.wheel_deadzone
+            wheels = (_step(self._sent[0], target[0], limit, floor),
+                      _step(self._sent[1], target[1], limit, floor))
         try:
             self._post("/drive", {"left": wheels[0], "right": wheels[1]})
         except requests.RequestException as exc:
@@ -144,7 +155,7 @@ class JetBotHttpDriver:
         return self._errors < 3
 
     @property
-    def last_wheels(self) -> tuple[float, float]:
+    def last_wheels(self) -> Tuple[float, float]:
         return self._sent
 
     def close(self) -> None:

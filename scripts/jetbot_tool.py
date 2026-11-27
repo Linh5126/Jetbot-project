@@ -1,7 +1,7 @@
 """JetBot connection check and motor calibration helpers (agent HTTP API on :8100).
 
   python scripts/jetbot_tool.py check
-  python scripts/jetbot_tool.py pulse --left 0.2 --right 0.2 --seconds 1
+  python scripts/jetbot_tool.py pulse --left 0.2 --right 0.2 --seconds 1   # ramped like the follower
   python scripts/jetbot_tool.py ramp --wheel both      # Ctrl+C when the wheel starts turning
 
 Keep the wheels OFF the ground while using pulse/ramp.
@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.following.jetbot_driver import _step  # noqa: E402
 from src.runtime.frame_source import MjpegHttpSource, build_stream_url  # noqa: E402
 
 MAX_PULSE_WHEEL = 0.6
@@ -40,11 +41,23 @@ def stop(session: requests.Session, base: str) -> None:
             print(f"WARNING: /stop failed: {exc}")
 
 
-def drive_for(session: requests.Session, base: str, left: float, right: float, seconds: float) -> None:
+def drive_for(session: requests.Session, base: str, left: float, right: float, seconds: float,
+              ramp: tuple = None) -> None:
+    """ramp = (max_step_per_tick, wheel_deadzone): accelerate like JetBotHttpDriver instead of a step."""
     end = time.monotonic() + seconds
+    sent = (0.0, 0.0)
     while time.monotonic() < end:
-        session.post(base + "/drive", json={"left": left, "right": right}, timeout=0.3).raise_for_status()
+        sent = (left, right) if ramp is None else (_step(sent[0], left, *ramp), _step(sent[1], right, *ramp))
+        session.post(base + "/drive", json={"left": sent[0], "right": sent[1]}, timeout=0.3).raise_for_status()
         time.sleep(0.1)
+
+
+def battery_warning(session: requests.Session, base: str) -> None:
+    battery = (session.get(base + "/status", timeout=2).json() or {}).get("battery") or {}
+    print("battery:", battery)
+    if isinstance(battery.get("percent"), (int, float)) and battery["percent"] < 50:
+        print("WARNING: battery below 50 %: wheels need more power to start (they creep, then jump)."
+              " Charge before measuring speed or the dead zone.")
 
 
 def cmd_check(cfg: dict, args) -> int:
@@ -100,10 +113,14 @@ def cmd_pulse(cfg: dict, args) -> int:
         print(f"Refused: need |left|,|right| <= {MAX_PULSE_WHEEL} and 0 < seconds <= {MAX_PULSE_SECONDS}")
         return 2
     base = base_url(cfg)
+    drive = cfg["drive"]
+    ramp = None if args.no_ramp else (drive["max_step_per_tick"], drive["wheel_deadzone"])
     with requests.Session() as s:
+        battery_warning(s, base)
         try:
-            print(f"drive left={args.left} right={args.right} for {args.seconds}s")
-            drive_for(s, base, args.left, args.right, args.seconds)
+            print(f"drive left={args.left} right={args.right} for {args.seconds}s"
+                  + (" (step, no ramp)" if ramp is None else " (ramped from the dead zone, as the follower)"))
+            drive_for(s, base, args.left, args.right, args.seconds, ramp)
         finally:
             stop(s, base)
     return 0
@@ -111,10 +128,11 @@ def cmd_pulse(cfg: dict, args) -> int:
 
 def cmd_ramp(cfg: dict, args) -> int:
     base = base_url(cfg)
-    level = 0.10
-    print("Ramp 0.10 -> 0.40. Press Ctrl+C as soon as the wheel starts turning;"
+    level = 0.02  # course agent min_duty=0: wheels already turn at 0.10 on this bot
+    print("Ramp 0.02 -> 0.40. Press Ctrl+C as soon as the wheel starts turning;"
           " the last printed level is drive.wheel_deadzone.")
     with requests.Session() as s:
+        battery_warning(s, base)
         try:
             while level <= 0.40 + 1e-9:
                 left = level if args.wheel in ("left", "both") else 0.0
@@ -140,6 +158,7 @@ def main() -> int:
     pulse.add_argument("--left", type=float, required=True)
     pulse.add_argument("--right", type=float, required=True)
     pulse.add_argument("--seconds", type=float, required=True)
+    pulse.add_argument("--no-ramp", action="store_true", help="jump straight to the wheel values")
     ramp = sub.add_parser("ramp", help="find the wheel dead zone")
     ramp.add_argument("--wheel", choices=("left", "right", "both"), default="both")
     args = parser.parse_args()

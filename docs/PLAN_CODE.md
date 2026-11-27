@@ -21,7 +21,7 @@ Phạm vi: nối pipeline hiện có (`demo_pc.py`, đang chạy với `MockRobo
 | Entry point | **Sửa `demo_pc.py`**, thêm `--driver mock\|jetbot` | Dùng lại toàn bộ UI, trace, phím tắt |
 | Hành vi khi mất mục tiêu | **Đứng yên** (không xoay tìm) | Giữ nguyên tính fail-closed |
 
-Không làm trong đợt này: chạy on-board/TensorRT, xoay tìm mục tiêu, tránh vật cản, khử méo fisheye, WebSocket.
+Không làm trong đợt này (on-board/TensorRT làm sau, xem `docs/ONBOARD.md`): xoay tìm mục tiêu, tránh vật cản, khử méo fisheye, WebSocket.
 
 Ràng buộc bắt buộc: với `--driver mock` và nguồn là file/ảnh, hành vi phải **giống hệt hiện tại** (để kết quả MOT17 và 50 test cũ không đổi).
 
@@ -416,7 +416,7 @@ Ba lệnh con, đều đọc `--robot-config configs/jetbot.yaml`:
 |---|---|
 | `check` | GET `/health`, `/status` (in `motor.ok`, `camera`, `imu`); đo RTT 10 lần trên `/health` (in min/trung bình/max); mở stream 5 giây, in FPS nhận được và kích thước frame; lưu frame cuối vào `outputs/jetbot_check.jpg` |
 | `pulse --left L --right R --seconds S` | Gửi `/drive` 10 Hz trong S giây rồi `/stop`, có `try/finally`. Từ chối nếu `abs(L)` hoặc `abs(R)` > 0,6 hoặc S > 3 |
-| `ramp --wheel left\|right\|both` | Tăng từ 0,10 tới 0,40, bước 0,02, mỗi mức 0,8 giây, in mức đang chạy. Người dùng nhấn Ctrl+C khi bánh bắt đầu quay; mức in cuối cùng là `wheel_deadzone` |
+| `ramp --wheel left\|right\|both` | Tăng từ 0,02 tới 0,40, bước 0,02, mỗi mức 0,8 giây, in mức đang chạy. Người dùng nhấn Ctrl+C khi bánh bắt đầu quay; mức in cuối cùng là `wheel_deadzone` |
 
 ---
 

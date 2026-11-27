@@ -73,8 +73,22 @@ def test_tick_rate_limits_acceleration():
     driver._tick()
     path, payload = calls[-1]
     assert path == "/drive"
-    assert 0 < payload["left"] <= CFG.max_step_per_tick
-    assert 0 < payload["right"] <= CFG.max_step_per_tick
+    target = mix(MotionCommand(forward=0.15), CFG)
+    for wheel, goal in zip((payload["left"], payload["right"]), target):
+        assert 0 < wheel <= CFG.wheel_deadzone + CFG.max_step_per_tick < goal
+
+
+def test_tick_brakes_and_reverses_without_ramp():
+    driver, calls, _ = make_driver()
+    driver.send(MotionCommand(forward=0.15))
+    for _ in range(5):
+        driver._tick()
+    pivot_right = mix(MotionCommand(turn=-0.3), CFG)  # left wheel +, right wheel -
+    driver.send(MotionCommand(turn=-0.3))
+    driver._tick()
+    left, right = calls[-1][1]["left"], calls[-1][1]["right"]
+    assert left == pytest.approx(pivot_right[0])  # braking: straight to target
+    assert pivot_right[1] <= right < 0  # reversal: no lingering forward spin
 
 
 def test_ttl_expiry_sends_zero():

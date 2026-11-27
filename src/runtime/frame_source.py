@@ -1,6 +1,6 @@
 """Unified frame sources: video file / image pattern, webcam, JetBot MJPEG stream."""
-from __future__ import annotations
 
+from typing import List, Optional
 import logging
 import threading
 import time
@@ -33,7 +33,7 @@ class FileSource:
         self.ended = False
         self._seq = 0
 
-    def read(self, timeout: float) -> FramePacket | None:
+    def read(self, timeout: float) -> Optional[FramePacket]:
         if self.ended:
             return None
         ok, frame = self._capture.read()
@@ -58,7 +58,7 @@ class _LatestFrameSource:
         self._stop = threading.Event()
         self._seq = 0
         self._last_returned = 0
-        self._packet: FramePacket | None = None
+        self._packet: Optional[FramePacket] = None
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
@@ -70,7 +70,7 @@ class _LatestFrameSource:
             self._packet = FramePacket(frame, self._seq, time.monotonic())
             self._cond.notify_all()
 
-    def read(self, timeout: float) -> FramePacket | None:
+    def read(self, timeout: float) -> Optional[FramePacket]:
         with self._cond:
             if not self._cond.wait_for(lambda: self._seq > self._last_returned, timeout):
                 return None
@@ -104,7 +104,7 @@ class LatestCaptureSource(_LatestFrameSource):
         self._capture.release()
 
 
-def extract_jpegs(buf: bytearray) -> list[bytes]:
+def extract_jpegs(buf: bytearray) -> List[bytes]:
     """Pop every complete JPEG (FFD8..FFD9) from buf; keep a partial tail for the next chunk."""
     out = []
     while True:
@@ -152,7 +152,7 @@ class MjpegHttpSource(_LatestFrameSource):
             self._stop.wait(1.0)
 
 
-def open_source(raw: str, stream_cfg: dict | None = None):
+def open_source(raw: str, stream_cfg: Optional[dict] = None):
     if raw.isdecimal():
         return LatestCaptureSource(int(raw))
     if raw.startswith(("http://", "https://")):

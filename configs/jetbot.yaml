@@ -1,26 +1,29 @@
 robot:
-  host: 192.168.16.44        # SỬA: IP hiện trên OLED của bot
+  host: 192.168.100.42          # SỬA: IP hiện trên OLED của bot
   port: 8100
 
 stream:
-  width: 640
-  height: 480
+  # Course agent v1.3.0: sensor runs 1280x720 (16:9), so keep 16:9 to avoid squashing.
+  # w/h/q only apply to whichever request opens the camera (shared, idle-off after 10 s).
+  # 480x270 q60 ~8 KB/frame: the best measured over a weak WiFi (640x360 ~15 KB/frame).
+  width: 480
+  height: 270
   fps: 15
-  quality: 80
+  quality: 60
   flip: 0                    # đổi thành 1 nếu ảnh bị lộn ngược
   connect_timeout_s: 3.0
   read_timeout_s: 2.0
 
 runtime:
-  expected_fps: 12           # SỬA: FPS pipeline đo được ở bước 10.2
+  expected_fps: 14           # SỬA: FPS pipeline đo được ở bước 10.2 (14,8 FPS trên Start Coffee Tea 5G, 23/11)
   stale_frame_s: 0.35        # frame cũ hơn mức này -> lệnh 0
   no_frame_timeout_s: 0.5    # không có frame mới trong khoảng này -> lệnh 0
-  max_lost_seconds: 5.0      # giây thật, sau đó STOPPED
+  max_lost_seconds: 10.0     # giây thật, sau đó STOPPED; 25/11: 5 s buộc chọn lại quá thường
 
 drive:
   forward_to_wheel: 2.0      # forward tối đa 0,15 -> 0,30
-  turn_to_wheel: 0.4         # turn tối đa 0,45 -> 0,18
-  wheel_deadzone: 0.15       # SỬA: đo ở bước 10.3
+  turn_to_wheel: 0.25        # 25/11: 0,4 làm xe xoay quá đà trên sàn (log robot_01)
+  wheel_deadzone: 0.08       # ramp trên sàn 25/11: cả hai bánh 0,08 (kê bánh: 0,06)
   max_wheel: 0.50
   left_trim: 1.0             # SỬA nếu xe đi lệch
   right_trim: 1.0
@@ -29,14 +32,63 @@ drive:
   send_hz: 10
   command_ttl_s: 0.4
   http_timeout_s: 0.3
-  max_step_per_tick: 0.15    # giới hạn tăng tốc mỗi lần gửi
+  max_step_per_tick: 0.06    # chỉ giới hạn tăng tốc (từ mép deadzone); phanh/đảo chiều tức thì (25/11 robot_04)
 
 controller:                  # ghi đè ControllerConfig
-  desired_person_height_ratio: 0.55   # SỬA sau khi thử khoảng cách bám
+  desired_person_height_ratio: 0.70   # 25/11: 0,55 dừng cách người 1,5-2 m, người dùng muốn bám gần hơn
   forward_gain: 0.55
-  turn_gain: 0.7
+  turn_gain: 0.5
   max_forward: 0.15
-  max_turn: 0.45
-  horizontal_deadband: 0.07
+  max_turn: 0.30
+  horizontal_deadband: 0.15          # lỗi chuẩn hóa (cx-0,5)*2; 0,07 quá hẹp nên xe xoay liên tục
   height_deadband: 0.06
   min_target_height_ratio: 0.08
+
+guard:                       # ghi đè ngưỡng Re-ID của Guard (mặc định CLI chọn trên MOT17)
+  # 25/11 trace_03: đúng người d trung vị 0,24, thường 0,27-0,33; người khác d >= 0,38 (trung vị 0,59).
+  # 0,32/0,28/0,26 làm LOST <-> VERIFYING chập chờn liên tục.
+  track_distance: 0.38
+  same_track_recovery_distance: 0.34
+  recovery_distance: 0.30
+  # 27/11 log pc_20261127_192720 (hành lang, ngược sáng): cùng người, cùng track d 0,34-0,52 khi nghiêng/đổi ánh sáng;
+  # người khác d p1 0,44, trung vị 0,55. Chỉ nới cho track ĐANG bám liên tục; track mới vẫn cần 0,30.
+  continuity_distance: 0.45
+  auto_views: 3               # tự thêm tối đa 3 ảnh mẫu khi đang bám chắc (phải khớp ảnh gốc <= track_distance)
+  blind_frames: 7             # track đang bám nhưng mất Re-ID (ngược sáng, khuất nửa): giữ tối đa 7 frame (~0,5 s)
+  drop_part_boxes: true       # YOLO đôi khi thêm box nửa trên trùng người đang bám -> OCCLUDED giả
+
+pc:                          # demo_pc.py --driver jetbot (AI trên PC, xe chỉ gửi ảnh + nhận lệnh bánh)
+  # 27/11 phát lại log pc_20261127_192720 (scripts/replay_log.py): yolov8n bám được 79 % số frame, yolov8s 88,5 %
+  # (người ngược sáng / khuất nửa vẫn được phát hiện); yolov8m không hơn. Nano vẫn dùng yolov8n-pose (TensorRT).
+  detector_weights: yolov8s.pt
+  collision_onnx: models/onboard/collision_resnet18.onnx   # scripts/train_collision.py; không có file -> tắt
+
+onboard:                     # onboard/run.py trên Nano (không cần PC/WiFi); engine build bằng onboard/build_engines.sh
+  yolo_engine: models/onboard/yolov8n_pose_288x480_fp16.engine   # YOLOv8n-pose: box + 17 keypoint (giơ tay)
+  osnet_engine: models/onboard/osnet_x0_5_fp16.engine
+  expected_fps: 14           # đo 25/11 với YOLOv8n detect: 14,3 FPS; SỬA sau khi đo lại với bản pose
+  detector_confidence: 0.10  # như demo_pc (ByteTrack cần box điểm thấp)
+  detector_iou: 0.50
+  select_hold_frames: 5      # --mode guarded: đúng một người giơ hai tay liên tục chừng này frame thì được chọn
+  select_hand_margin: 0.05    # cổ tay phải cao hơn vai quá mức này x chiều cao khung (cả hai tay)
+  enroll_seconds: 8.0         # xe đứng yên; người xoay một vòng chậm để thêm góc nhìn
+  enroll_new_view_distance: 0.25  # chỉ thêm khi khác các view đã có (cùng người, cùng hướng: d 0,2-0,3)
+  enroll_min_interval_s: 1.0
+  collision_engine: models/onboard/collision_resnet18_fp16.engine   # cả hai mode; không có file -> tắt kiểm tra vật cản
+  collision_threshold: 0.6    # P(blocked) >= mức này -> không tiến (vẫn được xoay)
+  follow:                     # StagedControllerConfig (src/following/controller.py), dùng cho cả hai mode
+    forward_speed: 0.21       # forward khi APPROACH (bánh = 0,08 + 2,0*0,21 = 0,50 = max_wheel, ~0,29 m/s đo 27/11)
+    stop_height_ratio: 0.70   # HOLD khi chiều cao box / khung >= mức này (25/11: muốn bám gần)
+    resume_margin: 0.05       # tiến lại khi chiều cao < stop_height_ratio - mức này
+    turn_gain: 0.5            # như controller.turn_gain đã chỉnh trên sàn
+    max_turn: 0.30            # như controller.max_turn
+    horizontal_deadband: 0.15 # 25/11: hẹp hơn làm xe xoay liên tục
+    max_side_error: 0.75      # người lệch hẳn sang bên -> chỉ xoay tại chỗ
+    settle_frames: 3          # box phải ổn định chừng này frame trước khi chạy
+    turn_smoothing: 0.3       # trọng số lệnh xoay mới (làm mượt, chống xoay quá đà)
+    head_cut_margin: 0.01     # đỉnh box sát mép trên ảnh (đầu bị cắt) -> coi là đủ gần, không tiến (mô phỏng 27/11)
+    slow_band: 0.15           # còn cách chiều cao dừng chừng này thì giảm tốc dần (27/11: tiến cố định 0,32 làm xe vọt)
+    min_forward_ratio: 0.5    # tốc độ chậm nhất khi sắp tới = 0,5 x forward_speed (bánh 0,08 + 2*0,105 = 0,29)
+    coast_frames: 7           # target mất <= 7 frame (~0,5 s) lúc đang tiến hết tốc (còn xa) -> chạy thẳng tiếp, không dừng-ramp lại (mô phỏng 27/11)
+    search_turn: 0.0          # >0 (vd 0,15): mất người ở rìa ảnh -> xoay chậm về phía đó, một chiều. TẮT: mô phỏng 27/11 không thấy lợi, có lượt xoay quá đà
+    search_frames: 28         # ... tối đa 28 frame (~2 s) rồi dừng; mất ở giữa ảnh thì không xoay

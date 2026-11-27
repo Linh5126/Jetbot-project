@@ -135,3 +135,88 @@ def test_config_validation():
         GuardConfig(recovery_distance=0.9, track_distance=0.2)
     with pytest.raises(ValueError):
         GuardConfig(max_overlap=1.5)
+
+
+def test_operator_added_views_extend_reference_only_when_verified():
+    side = np.array([0.7071, 0.7071, 0.], np.float32)  # d=0.29 to front A and to back B
+    lost = guarded()
+    lock_target(lost)
+    assert not lost.update(2, [det(emb=B)]).may_follow  # back view alone: mismatch
+    with pytest.raises(ValueError):
+        lost.add_view(2, [det(emb=B)])  # never while LOST
+    guard = guarded()
+    lock_target(guard)
+    assert guard.update(2, [det(emb=side)]).may_follow
+    with pytest.raises(ValueError):
+        guard.add_view(2, [det(emb=side), det(track=4, target=8, emb=B, box=(150, 100, 250, 350))])
+    assert guard.add_view(2, [det(emb=side)]) == 2
+    assert guard.update(3, [det(emb=B)]).may_follow  # back now matches via the side view
+    assert guard.add_view(3, [det(emb=B)]) == 3
+    assert guard.update(4, [det(track=9, target=90, emb=B)]).state == FollowState.VERIFYING
+    guard.select(TargetObservation.from_detection(det()), 5, [det()])  # reselect: one view
+    assert guard.view_count == 1
+
+
+def test_add_view_respects_max_views():
+    guard = GuardedTargetLock(GuardConfig(max_views=1))
+    lock_target(guard)
+    assert guard.update(2, [det()]).may_follow
+    with pytest.raises(ValueError):
+        guard.add_view(2, [det()])
+
+
+def _look(distance):
+    """Unit vector at cosine distance `distance` from A."""
+    return np.array([1 - distance, np.sqrt(1 - (1 - distance) ** 2), 0.], np.float32)
+
+
+def robot_guard(**kw):
+    return GuardedTargetLock(GuardConfig(confirm_frames=3, max_lost_frames=50, track_distance=0.38,
+                                         same_track_recovery_distance=0.34, recovery_distance=0.30, **kw))
+
+
+def test_continuity_distance_keeps_the_continuous_track_but_not_a_new_one():
+    guard = robot_guard(continuity_distance=0.45)
+    lock_target(guard)
+    assert guard.update(2, [det(emb=_look(0.42))]).state == FollowState.TRACKING  # same track leans
+    assert guard.update(3, [det(emb=_look(0.50))]).state == FollowState.LOST       # still too different
+    assert guard.update(4, [det(track=9, emb=_look(0.42))]).state == FollowState.LOST  # new track: strict
+
+
+def test_auto_views_adapt_but_never_drift_away_from_the_operator_look():
+    guard = robot_guard(auto_views=2, auto_view_interval=1, auto_view_min_distance=0.18)
+    lock_target(guard)
+    guard.update(2, [det(emb=_look(0.30))])          # new light, still the operator's person
+    assert len(guard._auto_anchors) == 1
+    guard.update(3, [det(emb=_look(0.10))])          # too similar to what is stored: not added
+    assert len(guard._auto_anchors) == 1
+    far = np.array([0.55, 0.0, 0.835], np.float32)   # 0.45 from A, but close to nothing stored either
+    assert guard.update(4, [det(emb=far)]).state == FollowState.LOST
+    assert len(guard._auto_anchors) == 1
+    guard.reset()
+    assert guard._auto_anchors == []
+
+
+def test_blind_frames_keep_the_trusted_track_briefly_without_reid():
+    guard = robot_guard(blind_frames=2)
+    lock_target(guard)
+    weak = det(quality=0.1)  # backlit: no usable Re-ID
+    assert guard.update(2, [weak]).may_follow
+    assert guard.diagnostics.reason_code == "TRACK_CONTINUED"
+    assert guard.update(3, [weak]).may_follow
+    assert not guard.update(4, [weak]).may_follow     # bounded
+    other = det(track=9, emb=A, box=(300, 100, 400, 350))
+    guard = robot_guard(blind_frames=2)
+    lock_target(guard)
+    assert not guard.update(2, [weak, other]).may_follow  # someone who looks right is in view
+    assert guard.diagnostics.reason_code != "TRACK_CONTINUED"
+
+
+def test_upper_body_box_on_the_same_person_is_not_an_occlusion():
+    guard = robot_guard(drop_part_boxes=True)
+    lock_target(guard)
+    part = det(track=9, emb=_look(0.2), box=(110, 102, 190, 230))  # same head, inside
+    assert guard.update(2, [det(), part]).state == FollowState.TRACKING
+    plain = robot_guard()
+    lock_target(plain)
+    assert plain.update(2, [det(), part]).state != FollowState.TRACKING
