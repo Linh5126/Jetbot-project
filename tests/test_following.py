@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from src.following.controller import FollowController, MotionCommand
+from src.following.controller import (FollowController, MotionCommand, StagedControllerConfig,
+                                      StagedFollowController)
 from src.following.driver import MockRobotDriver
 from src.following.target_lock import FollowState, TargetLockManager, TargetObservation
 from demo_pc import select_at_point
@@ -108,3 +109,90 @@ def test_switching_bytetrack_id_without_missing_frame_requires_verification():
     assert manager.update(2, [det(track=33)]).state == FollowState.VERIFYING
     assert not manager.update(2 + 1, [det(track=44)]).may_follow
     assert manager.update(4, [det(track=44)]).state == FollowState.REACQUIRED
+
+
+def staged(box, frames, ctrl=None, size=(480, 270)):
+    ctrl = ctrl or StagedFollowController()
+    for _ in range(frames):
+        command = ctrl.command_for_box(box, *size)
+    return ctrl, command
+
+
+def test_staged_controller_settles_before_moving_and_resets_on_jump_or_loss():
+    ctrl, command = staged((220, 60, 260, 210), 2)       # centred, h 0.56
+    assert ctrl.phase == "SETTLING" and command == MotionCommand()
+    ctrl, command = staged((220, 60, 260, 210), 1, ctrl)  # h 0.56: inside slow_band, slowing down
+    assert ctrl.phase == "APPROACH" and command.forward == pytest.approx(0.12 * (0.70 - 150 / 270) / 0.15)
+    assert command.turn == 0.0
+    ctrl, command = staged((0, 60, 40, 210), 1, ctrl)     # no overlap with the last box
+    assert ctrl.phase == "SETTLING" and command == MotionCommand()
+    ctrl, command = staged(None, 1, ctrl)
+    assert ctrl.phase == "IDLE" and command == MotionCommand()
+    assert staged((220, 60, 260, 70), 5)[1] == MotionCommand()   # too small
+    assert staged((260, 60, 220, 210), 5)[1] == MotionCommand()  # x2 < x1
+
+
+def test_staged_controller_holds_close_with_hysteresis():
+    ctrl, command = staged((200, 40, 280, 240), 3)       # h 0.74 >= 0.70
+    assert ctrl.phase == "HOLD" and command.forward == 0
+    ctrl, command = staged((200, 50, 280, 236), 1, ctrl)  # h 0.69: inside the margin, still HOLD
+    assert ctrl.phase == "HOLD"
+    ctrl, command = staged((200, 70, 280, 236), 1, ctrl)  # h 0.61 < 0.65: approach again, slowly
+    assert ctrl.phase == "APPROACH" and command.forward == pytest.approx(0.12 * (0.70 - 166 / 270) / 0.15)
+    ctrl, command = staged((200, 150, 280, 236), 3, StagedFollowController())  # h 0.32: far, full speed
+    assert command.forward == pytest.approx(0.12)
+
+
+def test_staged_controller_turn_sign_deadband_smoothing_and_turn_in_place():
+    ctrl, command = staged((300, 60, 420, 210), 3)       # right of centre: side error 0.5
+    assert command.turn == pytest.approx(0.3 * -0.25) and command.forward > 0  # one smoothed step
+    ctrl, command = staged((300, 60, 420, 210), 30, ctrl)
+    assert command.turn == pytest.approx(-0.25, abs=1e-3)  # negative = right
+    ctrl, command = staged((220, 60, 330, 210), 1, ctrl)  # side error 0.146 <= deadband 0.15
+    assert ctrl.phase == "APPROACH" and command.turn == 0.0
+    ctrl, command = staged((440, 60, 480, 210), 3)       # side error 0.92 > max_side_error
+    assert ctrl.phase == "HOLD" and command.forward == 0 and command.turn < 0  # turn in place
+    with pytest.raises(ValueError):
+        StagedControllerConfig(resume_margin=0.8)
+
+
+def test_staged_controller_does_not_approach_when_the_head_is_cut_off():
+    ctrl, command = staged((200, 0, 280, 160), 3)        # h 0.59 < stop, but the top touches the frame
+    assert ctrl.phase == "HOLD" and command.forward == 0
+    ctrl, command = staged((200, 5, 280, 160), 1, ctrl)   # top 0.019: barely back, keep holding
+    assert ctrl.phase == "HOLD"
+    ctrl, command = staged((200, 12, 280, 160), 1, ctrl)  # head clearly in view, h 0.55 < 0.65: approach
+    assert ctrl.phase == "APPROACH"
+
+
+
+def test_staged_controller_coasts_straight_through_a_short_flicker_only_when_far():
+    ctrl = StagedFollowController(StagedControllerConfig(coast_frames=2))
+    ctrl, command = staged((200, 150, 280, 236), 3, ctrl)  # h 0.32: far, full speed
+    ctrl, command = staged(None, 2, ctrl)
+    assert ctrl.phase == "COAST" and command == MotionCommand(forward=0.12)
+    ctrl, command = staged((200, 150, 280, 236), 1, ctrl)  # back: no settling again
+    assert ctrl.phase == "APPROACH"
+    ctrl, command = staged(None, 3, ctrl)                  # gone too long
+    assert ctrl.phase == "IDLE" and command == MotionCommand()
+    ctrl = StagedFollowController(StagedControllerConfig(coast_frames=2))
+    ctrl, command = staged((220, 60, 260, 210), 3, ctrl)   # h 0.56: slowing near the person
+    ctrl, command = staged(None, 1, ctrl)
+    assert ctrl.phase == "PAUSE" and command == MotionCommand()  # close: stop at once
+    ctrl, command = staged((220, 60, 260, 210), 1, ctrl)   # back in the same place: no settling again
+    assert ctrl.phase == "APPROACH"
+    assert staged(None, 1, staged((200, 150, 280, 236), 3)[0])[1] == MotionCommand()  # default: off
+
+
+def test_staged_controller_searches_once_towards_the_side_the_target_left():
+    cfg = StagedControllerConfig(coast_frames=1, search_turn=0.15, search_frames=3)
+    ctrl, command = staged((440, 60, 480, 210), 3, StagedFollowController(cfg))  # far right, turning right
+    ctrl, command = staged(None, 2, ctrl)  # brief loss first: still
+    assert ctrl.phase == "SEARCH" and command == MotionCommand(turn=-0.15)  # right = negative
+    ctrl, command = staged(None, 2, ctrl)
+    assert ctrl.phase == "SEARCH"
+    ctrl, command = staged(None, 1, ctrl)  # search time over
+    assert ctrl.phase == "IDLE" and command == MotionCommand()
+    ctrl, command = staged((220, 60, 260, 210), 3, StagedFollowController(cfg))  # lost in the centre
+    ctrl, command = staged(None, 3, ctrl)
+    assert ctrl.phase == "IDLE" and command == MotionCommand()  # no search

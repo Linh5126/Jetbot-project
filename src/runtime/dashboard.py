@@ -235,7 +235,7 @@ def _render_presentation(panel, result, command, diagnostics,
         for i, (frame_no, event) in enumerate(list(telemetry.events)[:2]):
             _text(panel, f"#{frame_no:04d}  {event}", 20, 630 + i * 21,
                   color=TEXT, scale=0.42, max_width=405)
-    _text(panel, "CLICK lock  |  R reset  |  SPACE stop  |  TAB research  |  Q exit",
+    _text(panel, "CLICK lock  |  A add view  |  R reset  |  SPACE stop  |  TAB research  |  Q exit",
           20, 671, color=MUTED, scale=0.34, max_width=420)
 
 
@@ -295,7 +295,7 @@ def _render_research(panel, result, command, diagnostics,
         frame_no, event = telemetry.events[0]
         _text(panel, f"LAST: #{frame_no:04d} {event}", 20, 648,
               color=MUTED, scale=0.39, max_width=410)
-    _text(panel, "TAB presentation  |  CLICK lock  |  R reset  |  SPACE stop  |  Q exit",
+    _text(panel, "TAB presentation  |  CLICK lock  |  A add view  |  R reset  |  SPACE stop  |  Q exit",
           20, 671, color=MUTED, scale=0.34, max_width=420)
 
 

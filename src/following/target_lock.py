@@ -4,11 +4,10 @@ The upstream V5/V5.1 manager performs appearance/motion association. This
 module does not independently run Re-ID; it adds confirmation before the
 controller can resume after any gap. Never silently select a different ID.
 """
-from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Optional, Sequence, Tuple
 
 
 class FollowState(str, Enum):
@@ -24,7 +23,7 @@ class FollowState(str, Enum):
 class TargetObservation:
     target_id: int
     track_id: int
-    bbox: tuple[float, float, float, float]
+    bbox: Tuple[float, float, float, float]
     confidence: float
     association: str = ""
 

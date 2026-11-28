@@ -1,29 +1,37 @@
-"""Interactive PC-only JetBot person-following dry run.
+"""Interactive JetBot person-following demo (AI runs on the PC).
 
-Click a person to lock their persistent identity. All velocity commands are
-sent to a MOCK driver; this script does not drive physical robot motors.
+Click a person to lock their persistent identity. With --driver mock (default)
+commands go to a MOCK driver; with --driver jetbot they are sent to the real
+robot over HTTP. The real robot always starts SAFE: press M to arm motors.
 
 Examples:
   python demo_pc.py --mode baseline --source 0
-  python demo_pc.py --mode v5_1 --source 0 --device cuda:0
   python demo_pc.py --mode v5_1 --source videos/crossing.mp4 --record-video demo.mp4
+  python demo_pc.py --source jetbot --driver mock --device cuda:0
+  python demo_pc.py --source jetbot --driver jetbot --device cuda:0
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 import yaml
 
-from src.following.controller import ControllerConfig, FollowController, MotionCommand
+from src.following.controller import (ControllerConfig, FollowController, MotionCommand,
+                                      StagedControllerConfig, StagedFollowController)
 from src.following.driver import MockRobotDriver
-from src.following.target_lock import TargetLockManager, TargetObservation
+from onboard.models import reid_batch
+from src.following.jetbot_driver import DriveConfig, JetBotHttpDriver
+from src.following.target_lock import FollowState, TargetLockManager, TargetObservation
 from src.following.guarded_lock import GuardConfig, GuardedTargetLock
 from src.evaluation.follow_trace import FollowTraceWriter, GroundTruthIndex
+from src.runtime.frame_source import build_stream_url, open_source
 from src.runtime.person_pipeline import PersonIdentityPipeline
 from src.runtime.overlay import render_demo_frame
 from src.runtime.dashboard import (DashboardTelemetry, render_dashboard_frame,
@@ -59,13 +67,47 @@ def run(args) -> None:
     if args.mode != "baseline":
         reid = cfg["reid"]["v5"]
         LOG.info("Re-ID: %s | checkpoint=%s", reid["model_name"], reid["checkpoint"])
-    source = parse_source(args.source)
-    capture = cv2.VideoCapture(source)
-    if not capture.isOpened():
-        raise RuntimeError(f"Cannot open video source: {args.source}")
-    writer = None
-    driver = MockRobotDriver()
-    window = "JetBot PC dry run (MOCK, no motors)"
+    robot_cfg = None
+    if args.driver == "jetbot" or args.source == "jetbot":
+        robot_cfg = yaml.safe_load(Path(args.robot_config).read_text(encoding="utf-8"))
+    raw_source = (build_stream_url(robot_cfg["robot"], robot_cfg["stream"])
+                  if args.source == "jetbot" else args.source)
+    source = open_source(raw_source, robot_cfg["stream"] if robot_cfg else None)
+    writer = raw_writer = robot_log_file = robot_log = det_log_file = det_log = None
+    collision = None  # cv2.dnn net of scripts/train_collision.py's ONNX, same check as onboard/run.py
+    jetbot = args.driver == "jetbot"
+    if jetbot:
+        base = f"http://{robot_cfg['robot']['host']}:{robot_cfg['robot']['port']}"
+        driver = JetBotHttpDriver(base, DriveConfig(**robot_cfg["drive"]))
+        try:
+            LOG.info("JetBot status: %s", driver.preflight())
+        except Exception:
+            driver.close()
+            source.close()
+            raise
+        # Same controller and settings as on the Nano (onboard/modes.py), checked by scripts/sim_follow.py.
+        controller = StagedFollowController(StagedControllerConfig(**robot_cfg["onboard"]["follow"]))
+        pc = robot_cfg.get("pc") or {}
+        cfg["detector"]["weights"] = pc.get("detector_weights", cfg["detector"]["weights"])
+        onnx = Path(pc.get("collision_onnx", "models/onboard/collision_resnet18.onnx"))
+        if onnx.exists():
+            collision = cv2.dnn.readNetFromONNX(str(onnx))
+            LOG.info("Obstacle check ON: %s", onnx)
+        else:
+            LOG.warning("No %s: obstacle check OFF (collect + train: docs/ONBOARD.md)", onnx)
+        stamp = time.strftime("%Y%m%d_%H%M%S")  # real robot: always keep logs for debugging
+        args.robot_log = args.robot_log or f"logs/pc_{stamp}_robot.csv"
+        args.trace_csv = args.trace_csv or f"logs/pc_{stamp}_trace.csv"
+        args.det_log = args.det_log or f"logs/pc_{stamp}_dets.csv"
+        args.record_raw = args.record_raw or f"logs/pc_{stamp}_raw.mp4"  # replay offline: --source <mp4>
+        LOG.info("Logs: %s, %s, %s, video %s", args.robot_log, args.trace_csv, args.det_log, args.record_raw)
+    else:
+        driver = MockRobotDriver()
+        controller = FollowController(ControllerConfig())
+    armed = not jetbot  # the real robot always starts SAFE
+    max_lost_seconds = (float(robot_cfg["runtime"]["max_lost_seconds"])
+                        if robot_cfg else args.max_lost_seconds)
+    window = "JetBot LIVE (REAL MOTORS, M = arm)" if jetbot else "JetBot PC dry run (MOCK, no motors)"
     runtime = {"detections": [], "frame_id": 0, "lock_result": None,
                "session": None, "session_count": 0, "gt_target_id": None,
                "pending_event": "", "frame": None, "reference_crop": None,
@@ -77,10 +119,18 @@ def run(args) -> None:
         if not (seq_path / "gt" / "gt.txt").exists():
             seq_path = Path(args.gt_root) / args.gt_sequence
         gt = GroundTruthIndex(seq_path, min_visibility=args.gt_min_visibility)
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    fps = fps if 1.0 <= fps <= 120.0 else 30.0
+    if source.live:
+        fps = float(robot_cfg["runtime"]["expected_fps"]) if robot_cfg else 15.0
+    else:
+        fps = (source.nominal_fps if source.nominal_fps and 1.0 <= source.nominal_fps <= 120.0
+               else 30.0)
     if gt is not None and 1 <= gt.frame_rate <= 120:
         fps = gt.frame_rate  # Image sequences otherwise default to arbitrary 25 FPS.
+    guard_distances = {"track_distance": args.guard_track_distance,
+                       "recovery_distance": args.guard_recovery_distance,
+                       "same_track_recovery_distance": args.guard_same_track_recovery_distance}
+    # JetBot camera (low, wide, close range) needs looser Re-ID thresholds than MOT17.
+    guard_distances.update((robot_cfg or {}).get("guard") or {})
     guarded = args.identity_guard == "on" and args.mode != "baseline"
     lock = (
         GuardedTargetLock(GuardConfig(
@@ -88,22 +138,19 @@ def run(args) -> None:
             same_track_confirm_frames=args.same_track_confirm_frames,
             min_final_clear_frames=args.guard_final_clear_frames,
             candidate_grace_frames=args.guard_grace_frames,
-            same_track_recovery_distance=args.guard_same_track_recovery_distance,
-            max_lost_frames=max(1, int(args.max_lost_seconds * fps)),
+            max_lost_frames=max(1, int(max_lost_seconds * fps)),
             min_confidence=args.min_target_confidence,
             min_crop_quality=args.guard_min_quality,
-            track_distance=args.guard_track_distance,
-            recovery_distance=args.guard_recovery_distance,
             ambiguity_margin=args.guard_margin,
             max_overlap=args.guard_overlap,
+            **guard_distances,
         ))
         if guarded else TargetLockManager(
             recovery_confirm_frames=args.confirm_frames,
-            max_lost_frames=max(1, int(args.max_lost_seconds * fps)),
+            max_lost_frames=max(1, int(max_lost_seconds * fps)),
             min_confidence=args.min_target_confidence,
         )
     )
-    controller = FollowController(ControllerConfig())
     dashboard = DashboardTelemetry()
     view_mode = args.dashboard_view
 
@@ -166,25 +213,60 @@ def run(args) -> None:
                 "reid_model": cfg["reid"]["v5"]["model_name"] if args.mode != "baseline" else None,
                 "reid_checkpoint": cfg["reid"]["v5"]["checkpoint"] if args.mode != "baseline" else None,
                 "identity_guard": guarded,
-                "guard_track_distance": args.guard_track_distance,
-                "guard_recovery_distance": args.guard_recovery_distance,
+                "guard_track_distance": guard_distances["track_distance"],
+                "guard_recovery_distance": guard_distances["recovery_distance"],
                 "guard_overlap": args.guard_overlap,
                 "gt_sequence": args.gt_sequence,
                 "gt_frame_offset": args.gt_frame_offset,
             }
+            if robot_cfg is not None:  # keep mock+file run.json unchanged
+                details.update(driver=args.driver, robot_config=robot_cfg)
             trace.path.with_suffix(".run.json").write_text(
                 json.dumps(details, indent=2, ensure_ascii=False), encoding="utf-8"
             )
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(window, click)
+        if args.det_log:  # every detection every frame: what the guard could choose from
+            Path(args.det_log).parent.mkdir(parents=True, exist_ok=True)
+            det_log_file = Path(args.det_log).open("w", newline="", encoding="utf-8")
+            det_log = csv.writer(det_log_file)
+            det_log.writerow(["frame", "track_id", "x1", "y1", "x2", "y2", "conf", "crop_quality",
+                              "ref_dist", "usable", "chosen"])
+        if args.robot_log:
+            path = Path(args.robot_log)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            robot_log_file = path.open("w", newline="", encoding="utf-8")
+            robot_log = csv.writer(robot_log_file)
+            robot_log.writerow(["frame", "t_wall_s", "frame_age_ms", "loop_ms", "state", "gate",
+                                "armed", "forward", "turn", "left", "right", "link_ok",
+                                 "phase", "cx", "h", "p_blocked"])
+        frame_timeout = (robot_cfg["runtime"]["no_frame_timeout_s"]
+                         if (robot_cfg and source.live) else 5.0)
+        stale_s = robot_cfg["runtime"]["stale_frame_s"] if robot_cfg else 0.35
+        lost_since = None
         last_time = time.perf_counter()
         processed = 0
         while True:
             frame_start = time.perf_counter()
-            ok, frame = capture.read()
-            if not ok:
-                LOG.info("Video source ended/unavailable; requested STOP")
-                break
+            packet = source.read(frame_timeout)
+            if packet is None:
+                if source.ended or not source.live:
+                    LOG.info("Video source ended/unavailable; requested STOP")
+                    break
+                driver.send(MotionCommand())  # no fresh image -> stop
+                if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
+                    break
+                continue
+            frame = packet.frame
+            if args.record_raw and raw_writer is None:
+                path = Path(args.record_raw)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                raw_writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                             fps, (frame.shape[1], frame.shape[0]))
+                if not raw_writer.isOpened():
+                    raise RuntimeError(f"Cannot write video: {path}")
+            if raw_writer is not None:
+                raw_writer.write(frame)  # before any rendering touches the frame
             processed += 1
             runtime["frame_id"] = processed
             runtime["frame"] = frame
@@ -193,11 +275,47 @@ def run(args) -> None:
             detections = pipeline.process(frame, processed)
             runtime["detections"] = detections
             result = lock.update(processed, detections)
+            if det_log is not None:
+                chosen = result.observation.track_id if result.observation else None
+                for det in detections:
+                    dist = lock._distance(det) if guarded else float("inf")
+                    det_log.writerow([processed, det["track_id"], *("%.1f" % v for v in det["bbox"]),
+                                      "%.3f" % det["confidence"], "%.3f" % det.get("crop_quality", -1),
+                                      "%.3f" % dist if dist < 9 else "",
+                                      int(lock._usable(det)) if guarded else "",
+                                      int(det["track_id"] == chosen)])
             old_result = runtime["lock_result"]
             if old_result is None or old_result.state != result.state:
                 LOG.info("Target state=%s reason=%s", result.state.value, result.reason)
             runtime["lock_result"] = result
             command = controller.command(result, frame.shape[1], frame.shape[0])
+            # Safety gate; the trace/dashboard below must see the gated command.
+            now = time.monotonic()
+            gate = ""
+            if source.live:
+                holding = result.state in (FollowState.LOST, FollowState.VERIFYING)
+                lost_since = (lost_since or now) if holding else None
+                if lost_since is not None and now - lost_since > max_lost_seconds:
+                    result = lock.stop("Target lost timeout (wall clock)")
+                    runtime["lock_result"] = result
+                    lost_since = None
+                    gate = "LOST_TIMEOUT"
+                    LOG.info("Target state=%s reason=%s", result.state.value, result.reason)
+                if now - packet.t_recv > stale_s:
+                    gate = gate or "STALE_FRAME"
+            p_blocked = None
+            if collision is not None and command.forward > 0:
+                collision.setInput(reid_batch([frame], (224, 224)))
+                logits = collision.forward()[0]
+                e = np.exp(logits - logits.max())
+                p_blocked = float(e[0] / e.sum())  # ImageFolder class order: blocked, free
+                if p_blocked >= robot_cfg["onboard"]["collision_threshold"]:
+                    command = MotionCommand(turn=command.turn)  # blocked: turning still allowed
+                    controller.phase = "BLOCKED"
+            if not armed:
+                gate = gate or "SAFE"
+            if gate:
+                command = MotionCommand()
             driver.send(command)
             diagnostics = getattr(lock, "diagnostics", None)
             if trace is not None:
@@ -233,23 +351,60 @@ def run(args) -> None:
                 writer.write(rendered)
             shown, runtime["display_scale"] = fit_display_frame(
                 rendered, args.display_width, args.display_height)
+            age_ms = 1000 * (time.monotonic() - packet.t_recv)
+            if jetbot:
+                # Drawn on the display copy only: recordings and dashboard stay unchanged.
+                left, right = driver.last_wheels
+                text = (f"{'ARMED' if armed else 'SAFE'} | link {'OK' if driver.link_ok else 'DOWN'} | "
+                        f"age {age_ms:.0f} ms | L {left:+.2f} R {right:+.2f} | {gate}")
+                color = (0, 0, 255) if armed else (0, 200, 0)
+                cv2.rectangle(shown, (0, 0), (shown.shape[1], 26), (0, 0, 0), -1)
+                cv2.putText(shown, text, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
             cv2.imshow(window, shown)
+            if robot_log is not None:
+                wheels = driver.last_wheels if jetbot else ("", "")
+                robot_log.writerow([
+                    processed, f"{time.perf_counter() - last_time:.3f}", f"{age_ms:.1f}",
+                    f"{1000 * (time.perf_counter() - frame_start):.1f}", result.state.value, gate,
+                    int(armed), command.forward, command.turn, wheels[0], wheels[1],
+                    int(driver.link_ok) if jetbot else "", getattr(controller, "phase", ""),
+                    *(("%.3f" % ((box[0] + box[2]) / (2 * frame.shape[1])),
+                       "%.3f" % ((box[3] - box[1]) / frame.shape[0]))
+                      if (box := result.observation and result.observation.bbox) else ("", "")),
+                    "" if p_blocked is None else "%.2f" % p_blocked])
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
+            if key == ord("m") and jetbot:
+                armed = not armed
+                LOG.warning("MOTORS %s", "ARMED" if armed else "SAFE")
+                dashboard.add_event(processed, "MOTORS ARMED" if armed else "MOTORS SAFE")
+                if not armed:
+                    driver.send(MotionCommand())
             if key in (9, ord("d")) and args.ui == "dashboard":
                 view_mode = "research" if view_mode == "presentation" else "presentation"
                 dashboard.add_event(processed, "VIEW " + view_mode.upper())
+            elif key == ord("a") and guarded:
+                # Operator confirms the box is the right person; adds e.g. their back view.
+                try:
+                    views = lock.add_view(processed, detections)
+                    dashboard.add_event(processed, f"VIEW ADDED ({views})")
+                    runtime["pending_event"] = "ADD_VIEW"
+                    LOG.info("Reference view added: %d views", views)
+                except ValueError as exc:
+                    LOG.warning("Cannot add view: %s", exc)
             elif key == ord("r"):
                 lock.reset()
                 runtime["reference_crop"] = None
                 dashboard.add_event(processed, "RESET")
                 runtime["session"] = runtime["gt_target_id"] = None
                 runtime["pending_event"] = "RESET"
+                armed = armed and not jetbot
                 driver.send(MotionCommand())
             elif key == 32:
                 lock.stop("Operator emergency stop (reset or click to reselect)")
                 dashboard.add_event(processed, "MANUAL STOP")
+                armed = armed and not jetbot
                 driver.send(MotionCommand())
         elapsed = time.perf_counter() - last_time
         LOG.info("Frames: %d, mean pipeline FPS: %.1f, last command: %s",
@@ -258,15 +413,33 @@ def run(args) -> None:
         driver.close()  # Always request zero on normal exit / exception.
         if trace is not None:
             trace.close()
-        capture.release()
+        source.close()
         if writer is not None:
             writer.release()
+        if raw_writer is not None:
+            raw_writer.release()
+        if robot_log_file is not None:
+            robot_log_file.close()
+        if det_log_file is not None:
+            det_log_file.close()
         cv2.destroyAllWindows()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Interactive PC demo (MOCK robot driver, NO real motors)")
-    parser.add_argument("--source", default="0", help="Webcam index or local video path")
+    parser = argparse.ArgumentParser(description="Interactive JetBot follow demo (AI on PC; "
+                                                 "--driver jetbot drives REAL motors)")
+    parser.add_argument("--source", default="0",
+                        help="Webcam index, local video path, http(s) MJPEG URL, or 'jetbot' "
+                             "(stream URL built from --robot-config)")
+    parser.add_argument("--driver", choices=("mock", "jetbot"), default="mock",
+                        help="mock = no motors (default); jetbot = real robot over HTTP")
+    parser.add_argument("--robot-config", default="configs/jetbot.yaml")
+    parser.add_argument("--record-raw", default=None, metavar="PATH",
+                        help="Record raw camera frames (no dashboard) for offline replay")
+    parser.add_argument("--det-log", default=None, metavar="PATH",
+                        help="Per-detection CSV (track, box, confidence, crop quality, Re-ID distance)")
+    parser.add_argument("--robot-log", default=None, metavar="PATH",
+                        help="Per-frame robot diagnostics CSV")
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--mode", choices=("baseline", "v5", "v5_1"), default="v5")
     parser.add_argument("--ablation", choices=sorted(IdentityManagerV5.STRATEGIES),
@@ -316,6 +489,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.mode == "baseline" and args.reid_model is not None:
         parser.error("--reid-model requires --mode v5 or v5_1")
+    if args.driver == "jetbot" and args.gt_sequence:
+        parser.error("--gt-sequence cannot be used with --driver jetbot")
     if args.gt_sequence and not args.trace_csv:
         parser.error("--gt-sequence requires --trace-csv")
     if args.display_width < 640 or args.display_height < 480:
