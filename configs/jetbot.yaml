@@ -60,7 +60,7 @@ guard:                       # ghi đè ngưỡng Re-ID của Guard (mặc đị
 pc:                          # demo_pc.py --driver jetbot (AI trên PC, xe chỉ gửi ảnh + nhận lệnh bánh)
   # 27/11 phát lại log pc_20261127_192720 (scripts/replay_log.py): yolov8n bám được 79 % số frame, yolov8s 88,5 %
   # (người ngược sáng / khuất nửa vẫn được phát hiện); yolov8m không hơn. Nano vẫn dùng yolov8n-pose (TensorRT).
-  detector_weights: yolov8s.pt
+  detector_weights: yolo26s.pt  # replay 27/11: 96.9% vs yolov8s 94.9%, yolo11m 96.5%
   collision_onnx: models/onboard/collision_resnet18.onnx   # scripts/train_collision.py; không có file -> tắt
 
 onboard:                     # onboard/run.py trên Nano (không cần PC/WiFi); engine build bằng onboard/build_engines.sh

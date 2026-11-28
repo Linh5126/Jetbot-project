@@ -3,7 +3,7 @@
 Một pipeline chung cho cả hai chế độ:
 
 YOLOv8n-pose (TensorRT FP16, 480x288, box + 17 keypoint) → chọn box mục tiêu → `StagedFollowController`
-(`src/following/controller.py`) → kiểm tra vật cản (nếu có engine) → `JetBotHttpDriver` → agent `127.0.0.1:8100`.
+(`src/following/controller.py`) → `JetBotHttpDriver` → agent `127.0.0.1:8100`.
 
 Hai chế độ chỉ khác nhau ở cách chọn box mục tiêu (`onboard/modes.py`):
 
@@ -111,9 +111,8 @@ ssh -t jetbot@<ip> "sudo systemctl stop jetbot-follow"     # không cho Nano và
 python scripts/replay_log.py logs/pc_<giờ> --device cuda:0  # phát lại offline, so Guard cũ / mới
 ```
 
-Mỗi lần chạy xe thật tự ghi vào `logs/`: `pc_<giờ>_robot.csv` (lệnh, bánh, pha, độ trễ, `p_blocked`),
+Mỗi lần chạy xe thật tự ghi vào `logs/`: `pc_<giờ>_robot.csv` (lệnh, bánh, pha, độ trễ),
 `_trace.csv` (Guard), `_dets.csv` (mọi box mỗi frame + khoảng cách Re-ID), `_raw.mp4` (video gốc để phát lại).
-Có `models/onboard/collision_resnet18.onnx` thì PC cũng chặn tiến khi có vật cản (cùng luật với Nano).
 
 ## Cài đặt (một lần)
 
@@ -149,23 +148,6 @@ python3 -m onboard.run --mode nearest --dry-run    # baseline gần tâm ảnh
 
 Log từng frame: `logs/onboard_<thời gian>.csv`. Dòng log "frame N, X FPS" cho FPS thật:
 ghi vào `onboard.expected_fps` trong `configs/jetbot.yaml` (dùng để đổi `max_lost_seconds` ra số frame).
-
-## Tránh vật cản bằng camera
-
-Classifier free/blocked (ResNet18, 224x224) nhìn cả khung ảnh. Dùng cho cả hai mode:
-khi P(blocked) >= `collision_threshold`, xe không tiến nhưng vẫn xoay được. Log ghi `BLOCKED` ở cột `reason`,
-kèm cột `p_blocked`. Không có file `collision_engine` thì kiểm tra này tắt.
-
-1. PC, robot bật WiFi: `python scripts/collect_collision.py`. Đặt xe bằng tay, nhấn `b` khi có vật cản
-   cách 20–30 cm, `f` khi đường trống. Ảnh "free" phải có cả cảnh **một người đứng cách 1–2 m**,
-   nếu không xe sẽ coi người đang bám là vật cản. Mỗi loại 100+ ảnh, nhiều chỗ, nhiều ánh sáng.
-2. PC: `python scripts/train_collision.py` → `models/onboard/collision_resnet18.onnx`.
-   Xem "blocked recall" ở epoch cuối: càng gần 1 càng ít bỏ sót vật cản.
-3. Chép file ONNX sang `~/jetbot_follow/models/onboard/` trên Nano rồi `sh onboard/build_engines.sh`
-   (hoặc chỉ build file này bằng dòng `trtexec` tương ứng trong script, ~2 phút).
-4. `sudo systemctl restart jetbot-follow` (nếu dùng service).
-
-Giới hạn: chỉ nhìn phía trước trong khung camera, không thấy vật thấp sát bánh hay vật ở hai bên khi xoay.
 
 ## Tự chạy khi bật nguồn
 

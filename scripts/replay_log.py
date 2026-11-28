@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 from src.following.controller import StagedControllerConfig, StagedFollowController  # noqa: E402
 from src.following.guarded_lock import GuardConfig, GuardedTargetLock  # noqa: E402
 from src.following.target_lock import TargetObservation  # noqa: E402
+from src.reid.model_config import REID_CHECKPOINTS, select_reid_model  # noqa: E402
 from src.runtime.person_pipeline import PersonIdentityPipeline  # noqa: E402
 
 FROZEN = dict(continuity_distance=0.0, auto_views=0, blind_frames=0)
@@ -91,12 +92,15 @@ def main():
     parser.add_argument("--robot-config", default=str(ROOT / "configs" / "jetbot.yaml"))
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--weights", default=None, help="detector weights instead of configs/config.yaml's")
+    parser.add_argument("--reid-model", choices=tuple(REID_CHECKPOINTS), default=None,
+                        help="Re-ID model instead of configs/config.yaml's (thresholds stay as configured)")
     parser.add_argument("--variant", choices=("frozen", "robot"), action="append")
     parser.add_argument("--csv", default=None, help="write the per-frame replay of the last variant")
     args = parser.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     if args.weights:
         cfg["detector"]["weights"] = args.weights
+    cfg = select_reid_model(cfg, args.reid_model)
     robot = yaml.safe_load(Path(args.robot_config).read_text(encoding="utf-8"))
     trace = pd.read_csv(str(args.prefix) + "_trace.csv")
     # The click happens between two frames: the SELECT event lands on the next trace row.

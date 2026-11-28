@@ -9,5 +9,8 @@ logs/
 yolov8n-pose.pt
 checkpoints/collision_resnet18.pth
 yolov8s.pt
+yolo11s.pt
+yolo11m.pt
+yolo26s.pt
 # demo video: has bystanders, blur before publishing
 docs/media/
